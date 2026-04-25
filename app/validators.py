@@ -19,12 +19,13 @@ MESSAGE_QUERY_KEYS = (
     "keyword",
 )
 MESSAGE_ID_KEYS = ("id", "message_id", "mensagem_id")
-MESSAGE_LIST_KEYS = ("messages", "mensagens")
+MESSAGE_LIST_KEYS = ("messages", "mensagens", "MENSAGENS")
 COLLECTION_FIELD_KEYS = (
     "collection_fields",
     "campos_coleta",
     "fields",
     "coleta",
+    "COLETA",
 )
 
 
@@ -199,6 +200,16 @@ def _has_enabled_collection_field(fields: Sequence[Any]) -> bool:
     return False
 
 
+def _validate_collection_patterns(fields: Sequence[Any]) -> None:
+    for field in fields:
+        if not isinstance(field, Mapping) or not _is_enabled(field.get("enabled"), default=False):
+            continue
+
+        pattern = field.get("pattern")
+        if pattern is not None:
+            validate_collection_regex(pattern)
+
+
 def validate_complete_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(config, Mapping):
         raise ValidationError("A configuracao deve estar em um formato valido.")
@@ -235,6 +246,7 @@ def validate_complete_config(config: Mapping[str, Any]) -> dict[str, Any]:
     fields = _iter_collection_fields(collection_fields)
     if not _has_enabled_collection_field(fields):
         raise ValidationError("A configuracao deve ter pelo menos um campo de coleta ativo.")
+    _validate_collection_patterns(fields)
 
     normalized_config = dict(config)
     normalized_config[messages_key] = normalized_messages

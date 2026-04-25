@@ -4,7 +4,7 @@ import json
 import threading
 from copy import deepcopy
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Any, Callable
 
 import customtkinter as ctk
@@ -15,6 +15,7 @@ from .validators import (
     ValidationError,
     validate_api_url,
     validate_complete_config,
+    validate_message_key,
     validate_token,
 )
 
@@ -234,6 +235,408 @@ class ConnectionFrame(ctk.CTkFrame):
         threading.Thread(target=worker, daemon=True).start()
 
 
+class MessageConfigFrame(ctk.CTkFrame):
+    def __init__(
+        self,
+        master: ctk.CTk,
+        current_config: dict[str, Any],
+        is_offline: bool,
+        mode_message: str,
+        on_back: Callable[[], None],
+        on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.current_config = current_config
+        self.is_offline = is_offline
+        self.mode_message = mode_message
+        self.on_back = on_back
+        self.on_current_config_changed = on_current_config_changed
+        self.editing_message_id: int | None = None
+
+        self._normalize_messages()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        panel = ctk.CTkFrame(self, corner_radius=8)
+        panel.grid(row=0, column=0, sticky="nsew", padx=28, pady=28)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            header,
+            text="Configurar mensagens-chave",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w")
+
+        back_button = ctk.CTkButton(header, text="Voltar", width=110, command=self.on_back)
+        back_button.grid(row=0, column=1, sticky="e")
+
+        mode_text = "Modo local/offline" if is_offline else "Servidor online"
+        mode_color = "#d97706" if is_offline else "#16a34a"
+        mode_label = ctk.CTkLabel(
+            panel,
+            text=f"{mode_text}. Alteracoes salvas apenas no estado local.",
+            text_color=mode_color,
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        )
+        mode_label.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 16))
+
+        form = ctk.CTkFrame(panel, corner_radius=8)
+        form.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))
+        form.grid_columnconfigure(0, weight=1)
+
+        input_label = ctk.CTkLabel(form, text="Mensagem-chave")
+        input_label.grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 6))
+
+        self.query_entry = ctk.CTkEntry(
+            form,
+            height=40,
+            placeholder_text="notebook vision ryzen 7",
+        )
+        self.query_entry.grid(row=1, column=0, sticky="ew", padx=(16, 10), pady=(0, 16))
+
+        self.submit_button = ctk.CTkButton(
+            form,
+            text="Adicionar",
+            width=130,
+            command=self.save_message,
+        )
+        self.submit_button.grid(row=1, column=1, sticky="e", padx=(0, 10), pady=(0, 16))
+
+        self.cancel_edit_button = ctk.CTkButton(
+            form,
+            text="Cancelar",
+            width=110,
+            command=self.cancel_edit,
+            state="disabled",
+        )
+        self.cancel_edit_button.grid(row=1, column=2, sticky="e", padx=(0, 16), pady=(0, 16))
+
+        list_header = ctk.CTkFrame(panel, fg_color="transparent")
+        list_header.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 8))
+        list_header.grid_columnconfigure(0, weight=1)
+
+        self.count_label = ctk.CTkLabel(
+            list_header,
+            text="Mensagens atuais",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        self.count_label.grid(row=0, column=0, sticky="w")
+
+        self.messages_container = ctk.CTkScrollableFrame(panel, corner_radius=8)
+        self.messages_container.grid(row=4, column=0, sticky="nsew", padx=24, pady=(0, 16))
+        self.messages_container.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            panel,
+            text="Adicione, edite, ative ou remova termos localmente.",
+            text_color=("gray35", "gray70"),
+            wraplength=700,
+            justify="left",
+            anchor="w",
+        )
+        self.status_label.grid(row=5, column=0, sticky="ew", padx=24, pady=(0, 24))
+
+        self.refresh_messages()
+
+    def _set_status(self, message: str, color: str | tuple[str, str] = ("gray35", "gray70")) -> None:
+        self.status_label.configure(text=message, text_color=color)
+
+    def _messages(self) -> list[dict[str, Any]]:
+        messages = self.current_config.get("MENSAGENS")
+        if not isinstance(messages, list):
+            messages = []
+            self.current_config["MENSAGENS"] = messages
+        return messages
+
+    def _normalize_messages(self) -> None:
+        raw_messages = self.current_config.get("MENSAGENS")
+        if not isinstance(raw_messages, list):
+            self.current_config["MENSAGENS"] = []
+            return
+
+        normalized_messages: list[dict[str, Any]] = []
+        used_ids: set[int] = set()
+        next_id = self._next_available_id(raw_messages, used_ids)
+
+        for item in raw_messages:
+            message = dict(item) if isinstance(item, dict) else {"query": str(item or "")}
+            message_id = self._coerce_id(message.get("id"))
+
+            if message_id is None or message_id in used_ids:
+                message_id = next_id
+                next_id += 1
+
+            used_ids.add(message_id)
+            message["id"] = message_id
+            message["query"] = str(message.get("query") or "")
+
+            if "ativa" not in message:
+                message["ativa"] = self._coerce_bool(message.get("enabled"), default=True)
+
+            normalized_messages.append(message)
+
+        self.current_config["MENSAGENS"] = normalized_messages
+
+    def _next_available_id(self, messages: list[Any], used_ids: set[int] | None = None) -> int:
+        used_ids = used_ids or set()
+        numeric_ids: list[int] = []
+
+        for message in messages:
+            if isinstance(message, dict):
+                message_id = self._coerce_id(message.get("id"))
+                if message_id is not None:
+                    numeric_ids.append(message_id)
+
+        next_id = max(numeric_ids, default=0) + 1
+        while next_id in used_ids:
+            next_id += 1
+        return next_id
+
+    def _coerce_id(self, value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
+
+    def _coerce_bool(self, value: Any, *, default: bool = True) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "sim", "yes", "on"}
+        return bool(value)
+
+    def _message_active(self, message: dict[str, Any]) -> bool:
+        if "ativa" in message:
+            return self._coerce_bool(message["ativa"], default=True)
+        return self._coerce_bool(message.get("enabled"), default=True)
+
+    def _find_message(self, message_id: int) -> dict[str, Any] | None:
+        for message in self._messages():
+            if self._coerce_id(message.get("id")) == message_id:
+                return message
+        return None
+
+    def _query_exists(self, query: str, ignored_message_id: int | None = None) -> bool:
+        target = self._query_compare_key(query)
+
+        for message in self._messages():
+            message_id = self._coerce_id(message.get("id"))
+            if ignored_message_id is not None and message_id == ignored_message_id:
+                continue
+            if self._query_compare_key(str(message.get("query") or "")) == target:
+                return True
+
+        return False
+
+    def _query_compare_key(self, query: str) -> str:
+        try:
+            return validate_message_key(query).casefold()
+        except ValidationError:
+            return str(query or "").strip().casefold()
+
+    def _notify_config_changed(self, message: str) -> None:
+        self.mode_message = message
+        self.on_current_config_changed(self.current_config, self.is_offline, message)
+
+    def refresh_messages(self) -> None:
+        for child in self.messages_container.winfo_children():
+            child.destroy()
+
+        messages = self._messages()
+        total = len(messages)
+        active_total = sum(1 for message in messages if self._message_active(message))
+        self.count_label.configure(text=f"Mensagens atuais: {total} ({active_total} ativas)")
+
+        if not messages:
+            empty_label = ctk.CTkLabel(
+                self.messages_container,
+                text="Nenhuma mensagem-chave cadastrada.",
+                text_color=("gray35", "gray70"),
+                anchor="w",
+            )
+            empty_label.grid(row=0, column=0, sticky="ew", padx=12, pady=16)
+            return
+
+        for row_index, message in enumerate(messages):
+            self._create_message_row(row_index, message)
+
+    def _create_message_row(self, row_index: int, message: dict[str, Any]) -> None:
+        message_id = self._coerce_id(message.get("id")) or 0
+        query = str(message.get("query") or "")
+        is_active = self._message_active(message)
+
+        row = ctk.CTkFrame(self.messages_container, corner_radius=8)
+        row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=6)
+        row.grid_columnconfigure(2, weight=1)
+
+        id_label = ctk.CTkLabel(row, text=f"#{message_id}", width=54)
+        id_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=10)
+
+        active_label = ctk.CTkLabel(
+            row,
+            text="Ativa" if is_active else "Inativa",
+            text_color="#16a34a" if is_active else "#d97706",
+            width=70,
+        )
+        active_label.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=10)
+
+        query_label = ctk.CTkLabel(
+            row,
+            text=query or "(sem query)",
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        )
+        query_label.grid(row=0, column=2, sticky="ew", padx=(0, 10), pady=10)
+
+        edit_button = ctk.CTkButton(
+            row,
+            text="Editar",
+            width=74,
+            command=lambda selected_id=message_id: self.start_edit(selected_id),
+        )
+        edit_button.grid(row=0, column=3, sticky="e", padx=(0, 8), pady=10)
+
+        toggle_button = ctk.CTkButton(
+            row,
+            text="Desativar" if is_active else "Ativar",
+            width=88,
+            command=lambda selected_id=message_id: self.toggle_message(selected_id),
+        )
+        toggle_button.grid(row=0, column=4, sticky="e", padx=(0, 8), pady=10)
+
+        delete_button = ctk.CTkButton(
+            row,
+            text="Deletar",
+            width=78,
+            fg_color="#b91c1c",
+            hover_color="#991b1b",
+            command=lambda selected_id=message_id: self.delete_message(selected_id),
+        )
+        delete_button.grid(row=0, column=5, sticky="e", padx=(0, 12), pady=10)
+
+    def save_message(self) -> None:
+        try:
+            query = validate_message_key(self.query_entry.get())
+        except ValidationError as exc:
+            self._set_status(str(exc), "#dc2626")
+            return
+
+        if self.editing_message_id is None:
+            self.add_message(query)
+            return
+
+        self.update_message(self.editing_message_id, query)
+
+    def add_message(self, query: str) -> None:
+        if self._query_exists(query):
+            self._set_status("Esta mensagem-chave ja esta cadastrada.", "#dc2626")
+            return
+
+        messages = self._messages()
+        messages.append(
+            {
+                "id": self._next_available_id(messages),
+                "query": query,
+                "ativa": True,
+            }
+        )
+
+        self.query_entry.delete(0, "end")
+        self._notify_config_changed("Mensagens-chave atualizadas em memoria.")
+        self.refresh_messages()
+        self._set_status("Mensagem-chave adicionada.", "#16a34a")
+
+    def start_edit(self, message_id: int) -> None:
+        message = self._find_message(message_id)
+        if message is None:
+            self._set_status("Mensagem-chave nao encontrada.", "#dc2626")
+            return
+
+        self.editing_message_id = message_id
+        self.query_entry.delete(0, "end")
+        self.query_entry.insert(0, str(message.get("query") or ""))
+        self.submit_button.configure(text="Salvar")
+        self.cancel_edit_button.configure(state="normal")
+        self._set_status(f"Editando mensagem #{message_id}.", ("gray35", "gray70"))
+
+    def update_message(self, message_id: int, query: str) -> None:
+        if self._query_exists(query, ignored_message_id=message_id):
+            self._set_status("Ja existe outra mensagem-chave com esse texto.", "#dc2626")
+            return
+
+        message = self._find_message(message_id)
+        if message is None:
+            self._set_status("Mensagem-chave nao encontrada.", "#dc2626")
+            return
+
+        message["query"] = query
+        self.cancel_edit()
+        self._notify_config_changed("Mensagens-chave atualizadas em memoria.")
+        self.refresh_messages()
+        self._set_status("Mensagem-chave editada.", "#16a34a")
+
+    def cancel_edit(self) -> None:
+        self.editing_message_id = None
+        self.query_entry.delete(0, "end")
+        self.submit_button.configure(text="Adicionar")
+        self.cancel_edit_button.configure(state="disabled")
+
+    def toggle_message(self, message_id: int) -> None:
+        message = self._find_message(message_id)
+        if message is None:
+            self._set_status("Mensagem-chave nao encontrada.", "#dc2626")
+            return
+
+        message["ativa"] = not self._message_active(message)
+        self._notify_config_changed("Mensagens-chave atualizadas em memoria.")
+        self.refresh_messages()
+
+        status = "ativada" if self._message_active(message) else "desativada"
+        self._set_status(f"Mensagem-chave {status}.", "#16a34a")
+
+    def delete_message(self, message_id: int) -> None:
+        message = self._find_message(message_id)
+        if message is None:
+            self._set_status("Mensagem-chave nao encontrada.", "#dc2626")
+            return
+
+        query = str(message.get("query") or "")
+        confirmed = messagebox.askyesno(
+            "Confirmar exclusao",
+            f"Deletar a mensagem-chave #{message_id}?\n\n{query}",
+            parent=self,
+        )
+        if not confirmed:
+            self._set_status("Exclusao cancelada.", ("gray35", "gray70"))
+            return
+
+        self.current_config["MENSAGENS"] = [
+            item for item in self._messages() if self._coerce_id(item.get("id")) != message_id
+        ]
+
+        if self.editing_message_id == message_id:
+            self.cancel_edit()
+
+        self._notify_config_changed("Mensagens-chave atualizadas em memoria.")
+        self.refresh_messages()
+        self._set_status("Mensagem-chave deletada.", "#16a34a")
+
+
 class MainMenuFrame(ctk.CTkFrame):
     def __init__(
         self,
@@ -243,6 +646,7 @@ class MainMenuFrame(ctk.CTkFrame):
         is_offline: bool,
         mode_message: str,
         on_edit_connection: Callable[[], None],
+        on_configure_messages: Callable[[], None],
         on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
         on_exit: Callable[[], None],
     ) -> None:
@@ -251,6 +655,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.current_config = current_config
         self.is_offline = is_offline
         self.on_edit_connection = on_edit_connection
+        self.on_configure_messages = on_configure_messages
         self.on_current_config_changed = on_current_config_changed
         self.on_exit = on_exit
 
@@ -364,7 +769,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self._set_status(f"{feature_name} sera implementado em uma pr\u00f3xima etapa.", "#d97706")
 
     def configure_messages(self) -> None:
-        self._not_ready("Configurar mensagens-chave")
+        self.on_configure_messages()
 
     def configure_collection(self) -> None:
         self._not_ready("Configurar dados de coleta")
@@ -564,8 +969,26 @@ class App(ctk.CTk):
                 is_offline=self.is_offline,
                 mode_message=self.mode_message,
                 on_edit_connection=self.show_connection,
+                on_configure_messages=self.show_messages_screen,
                 on_current_config_changed=self._update_current_config,
                 on_exit=self.destroy,
+            )
+        )
+
+    def show_messages_screen(self) -> None:
+        self._replace_frame(
+            MessageConfigFrame(
+                self,
+                current_config=self.current_config,
+                is_offline=self.is_offline,
+                mode_message=self.mode_message,
+                on_back=lambda: self.show_main_menu(
+                    self.connection_config,
+                    self.current_config,
+                    self.is_offline,
+                    self.mode_message,
+                ),
+                on_current_config_changed=self._update_current_config,
             )
         )
 

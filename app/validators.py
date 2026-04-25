@@ -174,6 +174,9 @@ def _message_enabled(message: Any) -> bool:
     if not isinstance(message, Mapping):
         return True
 
+    if "ativa" in message:
+        return _is_enabled(message.get("ativa"), default=True)
+
     return _is_enabled(message.get("enabled"), default=True)
 
 

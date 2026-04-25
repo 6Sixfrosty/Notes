@@ -12,7 +12,12 @@ from typing import Any, Callable
 
 import customtkinter as ctk
 
-from .api_client import ApiClientError, check_health, fetch_default_search_config
+from .api_client import (
+    ApiClientError,
+    check_health,
+    fetch_default_search_config,
+    sync_default_search_config,
+)
 from .local_config import AppConfig, ConfigError, load_config, save_config
 from .validators import (
     ValidationError,
@@ -999,6 +1004,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.on_configure_collection = on_configure_collection
         self.on_current_config_changed = on_current_config_changed
         self.on_exit = on_exit
+        self.sync_in_progress = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -1096,6 +1102,11 @@ class MainMenuFrame(ctk.CTkFrame):
     def _set_status(self, message: str, color: str | tuple[str, str] = ("gray35", "gray70")) -> None:
         self.status_label.configure(text=message, text_color=color)
 
+    def _format_validation_error(self, exc: ValidationError) -> str:
+        field = exc.field or "configuracao"
+        reason = exc.reason or str(exc)
+        return f"Configura\u00e7\u00e3o local inv\u00e1lida. Campo: {field}. Motivo: {reason}."
+
     def _set_mode(self, is_offline: bool, message: str) -> None:
         self.is_offline = is_offline
         self.mode_label.configure(text=self._mode_label_text(), text_color=self._mode_color())
@@ -1119,12 +1130,7 @@ class MainMenuFrame(ctk.CTkFrame):
         try:
             validated_config = validate_config(self.current_config)
         except ValidationError as exc:
-            field = exc.field or "configuracao"
-            reason = exc.reason or str(exc)
-            self._set_status(
-                f"Configura\u00e7\u00e3o local inv\u00e1lida. Campo: {field}. Motivo: {reason}.",
-                "#dc2626",
-            )
+            self._set_status(self._format_validation_error(exc), "#dc2626")
             return
 
         self._replace_current_config(
@@ -1135,7 +1141,60 @@ class MainMenuFrame(ctk.CTkFrame):
         self._set_status("Configura\u00e7\u00e3o local v\u00e1lida.", "#16a34a")
 
     def sync_with_server(self) -> None:
-        self._set_status("Sincronizacao com servidor ainda nao tem endpoint definido.", "#d97706")
+        if self.sync_in_progress:
+            self._set_status("Sincroniza\u00e7\u00e3o em andamento.", "#d97706")
+            return
+
+        try:
+            validated_config = validate_config(self.current_config)
+        except ValidationError as exc:
+            self._set_status(self._format_validation_error(exc), "#dc2626")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Confirmar sincronizacao",
+            "Enviar a configura\u00e7\u00e3o local para o servidor?",
+            parent=self,
+        )
+        if not confirmed:
+            self._set_status("Sincroniza\u00e7\u00e3o cancelada.", ("gray35", "gray70"))
+            return
+
+        self.current_config = validated_config
+        self.on_current_config_changed(self.current_config, self.is_offline, self.mode_message_label.cget("text"))
+        self.sync_in_progress = True
+        self._set_status("Sincronizando configura\u00e7\u00e3o com o servidor...", ("gray35", "gray70"))
+
+        def worker() -> None:
+            try:
+                response = sync_default_search_config(
+                    self.connection_config.api_base_url,
+                    self.connection_config.auth_token,
+                    self.current_config,
+                )
+            except ApiClientError as exc:
+                message = str(exc)
+                self.after(0, lambda: self._finish_sync_error(message))
+            else:
+                self.after(0, lambda: self._finish_sync_success(response))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_sync_success(self, response: dict[str, Any]) -> None:
+        self.sync_in_progress = False
+        version = response.get("version")
+        if version is not None:
+            self.current_config["version"] = version
+
+        message = "Configura\u00e7\u00e3o sincronizada com sucesso."
+        self._replace_current_config(self.current_config, False, message)
+        self._set_status(message, "#16a34a")
+
+    def _finish_sync_error(self, message: str) -> None:
+        self.sync_in_progress = False
+        if message.startswith("Servidor indispon"):
+            self._set_mode(True, message)
+        self._set_status(message, "#dc2626")
 
     def view_server_config(self) -> None:
         self._set_status("Carregando configura\u00e7\u00e3o do servidor...", ("gray35", "gray70"))

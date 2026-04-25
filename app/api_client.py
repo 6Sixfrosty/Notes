@@ -8,10 +8,23 @@ import httpx
 
 EXPECTED_SERVICE_NAME = "alerta-dos-notebooks-api"
 DEFAULT_SEARCH_CONFIG_PATH = "/api/v1/search-configs/default"
+SYNC_STATUS_MESSAGES = {
+    400: "JSON inv\u00e1lido.",
+    401: "Token ausente ou expirado.",
+    403: "Token inv\u00e1lido.",
+    409: "Conflito de vers\u00e3o. Recarregue a configura\u00e7\u00e3o do servidor.",
+    422: "Configura\u00e7\u00e3o inv\u00e1lida no servidor.",
+    429: "Muitas requisi\u00e7\u00f5es. Tente novamente depois.",
+    500: "Erro interno do servidor.",
+}
 
 
 class ApiClientError(Exception):
     """User-safe error raised when the API health check fails."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _build_api_url(api_base_url: str, path: str) -> str:
@@ -35,19 +48,40 @@ def _auth_headers(auth_token: str) -> dict[str, str]:
     return headers
 
 
-def _get_json(api_base_url: str, path: str, auth_token: str = "", timeout: float = 5.0) -> dict[str, Any]:
+def _request_json(
+    method: str,
+    api_base_url: str,
+    path: str,
+    auth_token: str = "",
+    timeout: float = 5.0,
+    json_body: dict[str, Any] | None = None,
+    status_messages: dict[int, str] | None = None,
+    timeout_message: str = "Tempo esgotado ao tentar conectar ao servidor.",
+    request_error_message: str = "Nao foi possivel conectar ao servidor. Verifique a URL da API.",
+) -> dict[str, Any]:
     url = _build_api_url(api_base_url, path)
 
     try:
-        response = httpx.get(url, headers=_auth_headers(auth_token), timeout=timeout)
+        response = httpx.request(
+            method,
+            url,
+            headers=_auth_headers(auth_token),
+            json=json_body,
+            timeout=timeout,
+        )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
-        raise ApiClientError(f"Servidor respondeu com status HTTP {status_code}.") from exc
+        message = (
+            status_messages.get(status_code)
+            if status_messages is not None
+            else f"Servidor respondeu com status HTTP {status_code}."
+        )
+        raise ApiClientError(message, status_code=status_code) from exc
     except httpx.TimeoutException as exc:
-        raise ApiClientError("Tempo esgotado ao tentar conectar ao servidor.") from exc
+        raise ApiClientError(timeout_message) from exc
     except httpx.RequestError as exc:
-        raise ApiClientError("Nao foi possivel conectar ao servidor. Verifique a URL da API.") from exc
+        raise ApiClientError(request_error_message) from exc
 
     try:
         data = response.json()
@@ -58,6 +92,10 @@ def _get_json(api_base_url: str, path: str, auth_token: str = "", timeout: float
         raise ApiClientError("Servidor respondeu em um formato inesperado.")
 
     return data
+
+
+def _get_json(api_base_url: str, path: str, auth_token: str = "", timeout: float = 5.0) -> dict[str, Any]:
+    return _request_json("GET", api_base_url, path, auth_token, timeout)
 
 
 def check_health(api_base_url: str, auth_token: str = "", timeout: float = 5.0) -> dict[str, Any]:
@@ -75,3 +113,22 @@ def fetch_default_search_config(
     timeout: float = 5.0,
 ) -> dict[str, Any]:
     return _get_json(api_base_url, DEFAULT_SEARCH_CONFIG_PATH, auth_token, timeout)
+
+
+def sync_default_search_config(
+    api_base_url: str,
+    auth_token: str,
+    current_config: dict[str, Any],
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    return _request_json(
+        "PUT",
+        api_base_url,
+        DEFAULT_SEARCH_CONFIG_PATH,
+        auth_token,
+        timeout,
+        json_body=current_config,
+        status_messages=SYNC_STATUS_MESSAGES,
+        timeout_message="Tempo de conex\u00e3o excedido.",
+        request_error_message="Servidor indispon\u00edvel. Configura\u00e7\u00e3o mantida localmente.",
+    )

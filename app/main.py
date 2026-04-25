@@ -15,6 +15,7 @@ import customtkinter as ctk
 from .api_client import (
     ApiClientError,
     check_health,
+    fetch_history_run,
     fetch_default_search_config,
     start_history_run,
     sync_default_search_config,
@@ -1374,6 +1375,199 @@ class HistoricalRunFrame(ctk.CTkFrame):
         self._set_status(message, "#dc2626")
 
 
+class HistoricalConsultFrame(ctk.CTkFrame):
+    KNOWN_STATUSES = {"queued", "running", "completed", "failed", "cancelled"}
+    STATUS_COLORS = {
+        "queued": "#d97706",
+        "running": "#2563eb",
+        "completed": "#16a34a",
+        "failed": "#dc2626",
+        "cancelled": "#6b7280",
+    }
+
+    def __init__(
+        self,
+        master: ctk.CTk,
+        connection_config: AppConfig,
+        on_back: Callable[[], None],
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.connection_config = connection_config
+        self.on_back = on_back
+        self.query_in_progress = False
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        panel = ctk.CTkFrame(self, corner_radius=8)
+        panel.grid(row=0, column=0, sticky="nsew", padx=28, pady=28)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            header,
+            text="Consultar pesquisa hist\u00f3rica",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w")
+
+        back_button = ctk.CTkButton(header, text="Voltar", width=110, command=self.on_back)
+        back_button.grid(row=0, column=1, sticky="e")
+
+        form = ctk.CTkFrame(panel, corner_radius=8)
+        form.grid(row=1, column=0, sticky="ew", padx=24, pady=(12, 18))
+        form.grid_columnconfigure(0, weight=1)
+
+        run_id_label = ctk.CTkLabel(form, text="Run ID")
+        run_id_label.grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 6))
+
+        self.run_id_entry = ctk.CTkEntry(
+            form,
+            height=40,
+            placeholder_text="history_2026_04_25_001",
+        )
+        self.run_id_entry.grid(row=1, column=0, sticky="ew", padx=(16, 10), pady=(0, 16))
+
+        self.last_run_button = ctk.CTkButton(
+            form,
+            text="Usar \u00faltimo run_id salvo",
+            width=190,
+            command=self.use_last_run_id,
+        )
+        self.last_run_button.grid(row=1, column=1, sticky="e", padx=(0, 10), pady=(0, 16))
+
+        self.query_button = ctk.CTkButton(
+            form,
+            text="Consultar",
+            width=120,
+            command=self.query_history,
+        )
+        self.query_button.grid(row=1, column=2, sticky="e", padx=(0, 16), pady=(0, 16))
+
+        last_run_text = self.connection_config.last_history_run_id or "Nenhum run_id salvo."
+        self.last_run_label = ctk.CTkLabel(
+            panel,
+            text=f"\u00daltimo run_id salvo: {last_run_text}",
+            text_color=("gray35", "gray70"),
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        )
+        self.last_run_label.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
+
+        self.status_label = ctk.CTkLabel(
+            panel,
+            text="Informe um run_id para consultar o andamento da pesquisa hist\u00f3rica.",
+            text_color=("gray35", "gray70"),
+            wraplength=700,
+            justify="left",
+            anchor="w",
+        )
+        self.status_label.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 12))
+
+        self.result_textbox = ctk.CTkTextbox(panel, wrap="none")
+        self.result_textbox.grid(row=4, column=0, sticky="nsew", padx=24, pady=(0, 24))
+        self._set_result_message("Nenhuma consulta executada.")
+
+    def _set_status(self, message: str, color: str | tuple[str, str] = ("gray35", "gray70")) -> None:
+        self.status_label.configure(text=message, text_color=color)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.run_id_entry.configure(state=state)
+        self.last_run_button.configure(state=state)
+        self.query_button.configure(state=state)
+
+    def _set_result_json(self, data: dict[str, Any]) -> None:
+        sanitized_data = sanitize_config_for_backup(data)
+        self.result_textbox.configure(state="normal")
+        self.result_textbox.delete("1.0", "end")
+        self.result_textbox.insert("1.0", json.dumps(sanitized_data, ensure_ascii=False, indent=2))
+        self.result_textbox.configure(state="disabled")
+
+    def _set_result_message(self, message: str) -> None:
+        self.result_textbox.configure(state="normal")
+        self.result_textbox.delete("1.0", "end")
+        self.result_textbox.insert("1.0", message)
+        self.result_textbox.configure(state="disabled")
+
+    def use_last_run_id(self) -> None:
+        last_run_id = self.connection_config.last_history_run_id.strip()
+        if not last_run_id:
+            self._set_status("Nenhum run_id salvo localmente.", "#dc2626")
+            return
+
+        self.run_id_entry.delete(0, "end")
+        self.run_id_entry.insert(0, last_run_id)
+        self._set_status("\u00daltimo run_id carregado no campo.", "#16a34a")
+
+    def query_history(self) -> None:
+        if self.query_in_progress:
+            self._set_status("Consulta em andamento.", "#d97706")
+            return
+
+        run_id = self.run_id_entry.get().strip()
+        if not run_id:
+            self._set_status("Informe o run_id.", "#dc2626")
+            return
+
+        self.query_in_progress = True
+        self._set_controls_enabled(False)
+        self.query_button.configure(text="Consultando...")
+        self._set_status("Consultando pesquisa hist\u00f3rica no servidor...", ("gray35", "gray70"))
+
+        def worker() -> None:
+            try:
+                response = fetch_history_run(
+                    self.connection_config.api_base_url,
+                    self.connection_config.auth_token,
+                    run_id,
+                )
+            except ApiClientError as exc:
+                message = str(exc)
+                self.after(0, lambda: self.winfo_exists() and self._finish_query_error(message))
+            else:
+                self.after(0, lambda: self.winfo_exists() and self._finish_query_success(response))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_query_success(self, response: dict[str, Any]) -> None:
+        self.query_in_progress = False
+        self._set_controls_enabled(True)
+        self.query_button.configure(text="Consultar")
+
+        status = str(response.get("status") or "").strip().lower()
+        run_id = str(response.get("run_id") or self.run_id_entry.get().strip())
+        total = response.get("total_resultados", 0)
+        created_at = str(response.get("created_at") or "nao informado")
+
+        self._set_result_json(response)
+
+        if status not in self.KNOWN_STATUSES:
+            self._set_status(
+                f"Run {run_id}: status desconhecido '{status or 'vazio'}'.",
+                "#d97706",
+            )
+            return
+
+        color = self.STATUS_COLORS.get(status, ("gray35", "gray70"))
+        self._set_status(
+            f"Run {run_id}: {status}. Total de resultados: {total}. Criado em: {created_at}.",
+            color,
+        )
+
+    def _finish_query_error(self, message: str) -> None:
+        self.query_in_progress = False
+        self._set_controls_enabled(True)
+        self.query_button.configure(text="Consultar")
+        self._set_result_message("Consulta nao concluida.")
+        self._set_status(message, "#dc2626")
+
+
 class MainMenuFrame(ctk.CTkFrame):
     def __init__(
         self,
@@ -1387,6 +1581,7 @@ class MainMenuFrame(ctk.CTkFrame):
         on_configure_collection: Callable[[], None],
         on_view_server_config: Callable[[], None],
         on_run_historical_search: Callable[[], None],
+        on_consult_historical_search: Callable[[], None],
         on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
         on_exit: Callable[[], None],
     ) -> None:
@@ -1399,6 +1594,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.on_configure_collection = on_configure_collection
         self.on_view_server_config = on_view_server_config
         self.on_run_historical_search = on_run_historical_search
+        self.on_consult_historical_search = on_consult_historical_search
         self.on_current_config_changed = on_current_config_changed
         self.on_exit = on_exit
         self.sync_in_progress = False
@@ -1633,7 +1829,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.on_run_historical_search()
 
     def consult_historical_search(self) -> None:
-        self._not_ready("Consultar pesquisa hist\u00f3rica")
+        self.on_consult_historical_search()
 
     def check_server_status(self) -> None:
         self._set_status("Consultando status do servidor...", ("gray35", "gray70"))
@@ -1742,6 +1938,7 @@ class App(ctk.CTk):
                 on_configure_collection=self.show_collection_screen,
                 on_view_server_config=self.show_server_config_screen,
                 on_run_historical_search=self.show_historical_run_screen,
+                on_consult_historical_search=self.show_historical_consult_screen,
                 on_current_config_changed=self._update_current_config,
                 on_exit=self.destroy,
             )
@@ -1805,6 +2002,20 @@ class App(ctk.CTk):
                 self,
                 connection_config=self.connection_config,
                 on_connection_config_changed=self._update_connection_config,
+                on_back=lambda: self.show_main_menu(
+                    self.connection_config,
+                    self.current_config,
+                    self.is_offline,
+                    self.mode_message,
+                ),
+            )
+        )
+
+    def show_historical_consult_screen(self) -> None:
+        self._replace_frame(
+            HistoricalConsultFrame(
+                self,
+                connection_config=self.connection_config,
                 on_back=lambda: self.show_main_menu(
                     self.connection_config,
                     self.current_config,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -23,6 +23,13 @@ HISTORY_RUN_STATUS_MESSAGES = {
     401: "Token inv\u00e1lido.",
     403: "Token inv\u00e1lido.",
     422: "Data inv\u00e1lida.",
+    429: "Muitas requisi\u00e7\u00f5es. Tente novamente depois.",
+    500: "Erro interno do servidor.",
+}
+HISTORY_RUN_QUERY_STATUS_MESSAGES = {
+    401: "Token inv\u00e1lido.",
+    403: "Token inv\u00e1lido.",
+    404: "Pesquisa hist\u00f3rica n\u00e3o encontrada.",
     429: "Muitas requisi\u00e7\u00f5es. Tente novamente depois.",
     500: "Erro interno do servidor.",
 }
@@ -157,6 +164,29 @@ def start_history_run(
         timeout,
         json_body={"date_limit": date_limit},
         status_messages=HISTORY_RUN_STATUS_MESSAGES,
+        timeout_message="Tempo de conex\u00e3o excedido.",
+        request_error_message="Servidor offline.",
+    )
+
+
+def fetch_history_run(
+    api_base_url: str,
+    auth_token: str,
+    run_id: str,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    normalized_run_id = run_id.strip()
+    if not normalized_run_id:
+        raise ApiClientError("Informe o run_id.")
+
+    encoded_run_id = quote(normalized_run_id, safe="")
+    return _request_json(
+        "GET",
+        api_base_url,
+        f"{HISTORY_RUNS_PATH}/{encoded_run_id}",
+        auth_token,
+        timeout,
+        status_messages=HISTORY_RUN_QUERY_STATUS_MESSAGES,
         timeout_message="Tempo de conex\u00e3o excedido.",
         request_error_message="Servidor offline.",
     )

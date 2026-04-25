@@ -76,6 +76,11 @@ def get_backup_path(today: date | None = None) -> Path:
     return EXPORTS_DIR / f"search_backup_{export_date:%Y_%m_%d}.json"
 
 
+def get_server_backup_path(today: date | None = None) -> Path:
+    export_date = today or date.today()
+    return EXPORTS_DIR / f"server_config_backup_{export_date:%Y_%m_%d}.json"
+
+
 def _is_sensitive_backup_key(key: Any) -> bool:
     normalized_key = str(key).casefold().replace("-", "_").replace(" ", "_")
     return any(key_part in normalized_key for key_part in SENSITIVE_BACKUP_KEY_PARTS)
@@ -93,6 +98,13 @@ def sanitize_config_for_backup(value: Any) -> Any:
         return [sanitize_config_for_backup(item) for item in value]
 
     return value
+
+
+def format_export_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 class ConnectionFrame(ctk.CTkFrame):
@@ -981,6 +993,229 @@ class CollectionConfigFrame(ctk.CTkFrame):
         self._set_status(message, "#16a34a")
 
 
+class ServerConfigFrame(ctk.CTkFrame):
+    def __init__(
+        self,
+        master: ctk.CTk,
+        connection_config: AppConfig,
+        current_config: dict[str, Any],
+        is_offline: bool,
+        mode_message: str,
+        on_back: Callable[[], None],
+        on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.connection_config = connection_config
+        self.current_config = current_config
+        self.is_offline = is_offline
+        self.mode_message = mode_message
+        self.on_back = on_back
+        self.on_current_config_changed = on_current_config_changed
+        self.server_config: dict[str, Any] | None = None
+        self.loading = False
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        panel = ctk.CTkFrame(self, corner_radius=8)
+        panel.grid(row=0, column=0, sticky="nsew", padx=28, pady=28)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(3, weight=1)
+
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            header,
+            text="Ver configura\u00e7\u00e3o do servidor",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w")
+
+        back_button = ctk.CTkButton(header, text="Voltar", width=100, command=self.on_back)
+        back_button.grid(row=0, column=1, sticky="e")
+
+        actions = ctk.CTkFrame(panel, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 14))
+        actions.grid_columnconfigure(0, weight=1)
+
+        self.reload_button = ctk.CTkButton(
+            actions,
+            text="Recarregar",
+            width=116,
+            command=self.reload_server_config,
+        )
+        self.reload_button.grid(row=0, column=1, sticky="e", padx=(0, 10))
+
+        use_button = ctk.CTkButton(
+            actions,
+            text="Usar esta configura\u00e7\u00e3o localmente",
+            width=220,
+            command=self.use_server_config_locally,
+        )
+        use_button.grid(row=0, column=2, sticky="e", padx=(0, 10))
+
+        export_button = ctk.CTkButton(
+            actions,
+            text="Exportar backup",
+            width=140,
+            command=self.export_server_backup,
+        )
+        export_button.grid(row=0, column=3, sticky="e")
+
+        self.status_label = ctk.CTkLabel(
+            panel,
+            text="Carregando configura\u00e7\u00e3o do servidor...",
+            text_color=("gray35", "gray70"),
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        )
+        self.status_label.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 14))
+
+        content = ctk.CTkFrame(panel, fg_color="transparent")
+        content.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 24))
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(1, weight=1)
+
+        server_label = ctk.CTkLabel(
+            content,
+            text="Servidor",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        server_label.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+
+        local_label = ctk.CTkLabel(
+            content,
+            text="Local atual",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        local_label.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=(0, 8))
+
+        self.server_textbox = ctk.CTkTextbox(content, wrap="none")
+        self.server_textbox.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+
+        self.local_textbox = ctk.CTkTextbox(content, wrap="none")
+        self.local_textbox.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+
+        self._set_textbox_json(self.local_textbox, sanitize_config_for_backup(self.current_config))
+        self._set_textbox_message(self.server_textbox, "Carregando...")
+        self.after(50, lambda: self.winfo_exists() and self.reload_server_config())
+
+    def _set_status(self, message: str, color: str | tuple[str, str] = ("gray35", "gray70")) -> None:
+        self.status_label.configure(text=message, text_color=color)
+
+    def _set_textbox_json(self, textbox: ctk.CTkTextbox, data: Any) -> None:
+        textbox.configure(state="normal")
+        textbox.delete("1.0", "end")
+        textbox.insert("1.0", json.dumps(data, ensure_ascii=False, indent=2))
+        textbox.configure(state="disabled")
+
+    def _set_textbox_message(self, textbox: ctk.CTkTextbox, message: str) -> None:
+        textbox.configure(state="normal")
+        textbox.delete("1.0", "end")
+        textbox.insert("1.0", message)
+        textbox.configure(state="disabled")
+
+    def _server_config_for_display(self) -> dict[str, Any] | None:
+        if self.server_config is None:
+            return None
+        sanitized = sanitize_config_for_backup(self.server_config)
+        if isinstance(sanitized, dict):
+            return sanitized
+        return {}
+
+    def reload_server_config(self) -> None:
+        if self.loading:
+            return
+
+        self.loading = True
+        self.reload_button.configure(state="disabled", text="Carregando...")
+        self._set_status("Carregando configura\u00e7\u00e3o do servidor...", ("gray35", "gray70"))
+        self._set_textbox_message(self.server_textbox, "Carregando...")
+
+        def worker() -> None:
+            try:
+                server_config = fetch_default_search_config(
+                    self.connection_config.api_base_url,
+                    self.connection_config.auth_token,
+                )
+            except ApiClientError as exc:
+                message = str(exc)
+                self.after(0, lambda: self.winfo_exists() and self._finish_reload_error(message))
+            else:
+                self.after(0, lambda: self.winfo_exists() and self._finish_reload_success(server_config))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_reload_success(self, server_config: dict[str, Any]) -> None:
+        self.loading = False
+        self.reload_button.configure(state="normal", text="Recarregar")
+        self.server_config = server_config
+        sanitized_server_config = self._server_config_for_display() or {}
+        self._set_textbox_json(self.server_textbox, sanitized_server_config)
+        self._set_status("Configura\u00e7\u00e3o do servidor carregada.", "#16a34a")
+
+    def _finish_reload_error(self, message: str) -> None:
+        self.loading = False
+        self.reload_button.configure(state="normal", text="Recarregar")
+        self.server_config = None
+        self._set_textbox_message(self.server_textbox, "Nenhuma configura\u00e7\u00e3o do servidor carregada.")
+        self._set_status(f"Nao foi possivel carregar a configura\u00e7\u00e3o do servidor: {message}", "#dc2626")
+
+    def use_server_config_locally(self) -> None:
+        sanitized_server_config = self._server_config_for_display()
+        if sanitized_server_config is None:
+            self._set_status("Carregue a configura\u00e7\u00e3o do servidor antes de usar localmente.", "#dc2626")
+            return
+
+        self.current_config = deepcopy(sanitized_server_config)
+        message = "Configura\u00e7\u00e3o do servidor aplicada localmente."
+        self.mode_message = message
+        self.is_offline = False
+        self.on_current_config_changed(self.current_config, self.is_offline, message)
+        self._set_textbox_json(self.local_textbox, sanitize_config_for_backup(self.current_config))
+        self._set_status(message, "#16a34a")
+
+    def export_server_backup(self) -> None:
+        sanitized_server_config = self._server_config_for_display()
+        if sanitized_server_config is None:
+            self._set_status("Carregue a configura\u00e7\u00e3o do servidor antes de exportar.", "#dc2626")
+            return
+
+        backup_path = get_server_backup_path()
+
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Nao foi possivel criar a pasta exports: {exc}", "#dc2626")
+            return
+
+        if backup_path.exists():
+            relative_path = format_export_path(backup_path)
+            confirmed = messagebox.askyesno(
+                "Confirmar exportacao",
+                f"O arquivo {relative_path} ja existe.\n\nDeseja substituir?",
+                parent=self,
+            )
+            if not confirmed:
+                self._set_status("Exportacao cancelada.", ("gray35", "gray70"))
+                return
+
+        try:
+            with backup_path.open("w", encoding="utf-8") as backup_file:
+                json.dump(sanitized_server_config, backup_file, ensure_ascii=False, indent=2)
+                backup_file.write("\n")
+        except OSError as exc:
+            self._set_status(f"Nao foi possivel exportar o backup: {exc}", "#dc2626")
+            return
+
+        relative_path = format_export_path(backup_path)
+        self._set_status(f"Backup do servidor exportado para {relative_path}.", "#16a34a")
+
+
 class MainMenuFrame(ctk.CTkFrame):
     def __init__(
         self,
@@ -992,6 +1227,7 @@ class MainMenuFrame(ctk.CTkFrame):
         on_edit_connection: Callable[[], None],
         on_configure_messages: Callable[[], None],
         on_configure_collection: Callable[[], None],
+        on_view_server_config: Callable[[], None],
         on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
         on_exit: Callable[[], None],
     ) -> None:
@@ -1002,6 +1238,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.on_edit_connection = on_edit_connection
         self.on_configure_messages = on_configure_messages
         self.on_configure_collection = on_configure_collection
+        self.on_view_server_config = on_view_server_config
         self.on_current_config_changed = on_current_config_changed
         self.on_exit = on_exit
         self.sync_in_progress = False
@@ -1197,36 +1434,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self._set_status(message, "#dc2626")
 
     def view_server_config(self) -> None:
-        self._set_status("Carregando configura\u00e7\u00e3o do servidor...", ("gray35", "gray70"))
-
-        def worker() -> None:
-            try:
-                server_config = fetch_default_search_config(
-                    self.connection_config.api_base_url,
-                    self.connection_config.auth_token,
-                )
-            except ApiClientError as exc:
-                message = str(exc)
-                self.after(
-                    0,
-                    lambda: self._set_status(
-                        f"Nao foi possivel carregar a configura\u00e7\u00e3o do servidor: {message}",
-                        "#dc2626",
-                    ),
-                )
-            else:
-                self.after(0, lambda: self._finish_view_server_config(server_config))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _finish_view_server_config(self, server_config: dict[str, Any]) -> None:
-        self._replace_current_config(
-            server_config,
-            False,
-            "Configura\u00e7\u00e3o do servidor carregada.",
-        )
-        self._set_status("Configura\u00e7\u00e3o do servidor carregada.", "#16a34a")
-        self._show_json_window("Configura\u00e7\u00e3o do servidor", server_config)
+        self.on_view_server_config()
 
     def export_backup(self) -> None:
         backup_path = get_backup_path()
@@ -1238,7 +1446,7 @@ class MainMenuFrame(ctk.CTkFrame):
             return
 
         if backup_path.exists():
-            relative_path = backup_path.relative_to(PROJECT_ROOT)
+            relative_path = format_export_path(backup_path)
             confirmed = messagebox.askyesno(
                 "Confirmar exportacao",
                 f"O arquivo {relative_path} ja existe.\n\nDeseja substituir?",
@@ -1258,7 +1466,7 @@ class MainMenuFrame(ctk.CTkFrame):
             self._set_status(f"Nao foi possivel exportar o backup: {exc}", "#dc2626")
             return
 
-        relative_path = backup_path.relative_to(PROJECT_ROOT)
+        relative_path = format_export_path(backup_path)
         self._set_status(f"Backup exportado para {relative_path}.", "#16a34a")
 
     def run_historical_search(self) -> None:
@@ -1296,24 +1504,6 @@ class MainMenuFrame(ctk.CTkFrame):
     def _finish_server_status(self, is_offline: bool, message: str) -> None:
         self._set_mode(is_offline, message)
         self._set_status(message, "#d97706" if is_offline else "#16a34a")
-
-    def _show_json_window(self, title: str, data: dict[str, Any]) -> None:
-        window = ctk.CTkToplevel(self)
-        window.title(title)
-        window.geometry("720x520")
-        window.minsize(520, 360)
-        window.transient(self.winfo_toplevel())
-        window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(0, weight=1)
-
-        textbox = ctk.CTkTextbox(window, wrap="none")
-        textbox.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 10))
-        textbox.insert("1.0", json.dumps(data, ensure_ascii=False, indent=2))
-        textbox.configure(state="disabled")
-
-        close_button = ctk.CTkButton(window, text="Fechar", command=window.destroy)
-        close_button.grid(row=1, column=0, sticky="e", padx=16, pady=(0, 16))
-
 
 class App(ctk.CTk):
     def __init__(self) -> None:
@@ -1387,6 +1577,7 @@ class App(ctk.CTk):
                 on_edit_connection=self.show_connection,
                 on_configure_messages=self.show_messages_screen,
                 on_configure_collection=self.show_collection_screen,
+                on_view_server_config=self.show_server_config_screen,
                 on_current_config_changed=self._update_current_config,
                 on_exit=self.destroy,
             )
@@ -1413,6 +1604,24 @@ class App(ctk.CTk):
         self._replace_frame(
             CollectionConfigFrame(
                 self,
+                current_config=self.current_config,
+                is_offline=self.is_offline,
+                mode_message=self.mode_message,
+                on_back=lambda: self.show_main_menu(
+                    self.connection_config,
+                    self.current_config,
+                    self.is_offline,
+                    self.mode_message,
+                ),
+                on_current_config_changed=self._update_current_config,
+            )
+        )
+
+    def show_server_config_screen(self) -> None:
+        self._replace_frame(
+            ServerConfigFrame(
+                self,
+                connection_config=self.connection_config,
                 current_config=self.current_config,
                 is_offline=self.is_offline,
                 mode_message=self.mode_message,

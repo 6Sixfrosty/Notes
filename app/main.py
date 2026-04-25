@@ -7,6 +7,7 @@ import customtkinter as ctk
 
 from .api_client import ApiClientError, check_health
 from .local_config import AppConfig, ConfigError, load_config, save_config
+from .validators import ValidationError, validate_api_url, validate_token
 
 
 APP_TITLE = "Alerta dos Notebooks"
@@ -104,8 +105,22 @@ class ConnectionFrame(ctk.CTkFrame):
     def _set_status(self, message: str, color: str | tuple[str, str]) -> None:
         self.status_label.configure(text=message, text_color=color)
 
+    def _update_api_url_entry(self, api_base_url: str) -> None:
+        self.api_url_entry.delete(0, "end")
+        self.api_url_entry.insert(0, api_base_url)
+
     def test_connection(self) -> None:
-        config = self._current_config()
+        raw_config = self._current_config()
+
+        try:
+            api_base_url = validate_api_url(raw_config.api_base_url)
+        except ValidationError as exc:
+            self._set_status(str(exc), "#dc2626")
+            return
+
+        self._update_api_url_entry(api_base_url)
+        config = AppConfig(api_base_url=api_base_url, auth_token=raw_config.auth_token)
+
         self.test_button.configure(state="disabled", text="Testando...")
         self._set_status("Testando conexão com o servidor...", ("gray35", "gray70"))
 
@@ -124,11 +139,17 @@ class ConnectionFrame(ctk.CTkFrame):
         self._set_status(message, color)
 
     def continue_to_app(self) -> None:
-        config = self._current_config()
+        raw_config = self._current_config()
 
-        if not config.api_base_url:
-            self._set_status("Informe a URL da API antes de continuar.", "#dc2626")
+        try:
+            api_base_url = validate_api_url(raw_config.api_base_url)
+            auth_token = validate_token(raw_config.auth_token)
+        except ValidationError as exc:
+            self._set_status(str(exc), "#dc2626")
             return
+
+        self._update_api_url_entry(api_base_url)
+        config = AppConfig(api_base_url=api_base_url, auth_token=auth_token)
 
         try:
             save_config(config)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -14,6 +16,7 @@ from .local_config import AppConfig, ConfigError, load_config, save_config
 from .validators import (
     ValidationError,
     validate_api_url,
+    validate_collection_regex,
     validate_complete_config,
     validate_message_key,
     validate_token,
@@ -43,6 +46,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 def get_default_config() -> dict[str, Any]:
     return deepcopy(DEFAULT_CONFIG)
+
+
+def get_default_collection_config() -> dict[str, dict[str, Any]]:
+    return deepcopy(DEFAULT_CONFIG["COLETA"])
 
 
 class ConnectionFrame(ctk.CTkFrame):
@@ -637,6 +644,300 @@ class MessageConfigFrame(ctk.CTkFrame):
         self._set_status("Mensagem-chave deletada.", "#16a34a")
 
 
+class CollectionConfigFrame(ctk.CTkFrame):
+    def __init__(
+        self,
+        master: ctk.CTk,
+        current_config: dict[str, Any],
+        is_offline: bool,
+        mode_message: str,
+        on_back: Callable[[], None],
+        on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
+    ) -> None:
+        super().__init__(master, fg_color="transparent")
+        self.current_config = current_config
+        self.is_offline = is_offline
+        self.mode_message = mode_message
+        self.on_back = on_back
+        self.on_current_config_changed = on_current_config_changed
+        self.draft_collection = self._build_draft_collection()
+        self.pattern_entries: dict[str, ctk.CTkEntry] = {}
+        self.enabled_switches: dict[str, ctk.CTkSwitch] = {}
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        panel = ctk.CTkFrame(self, corner_radius=8)
+        panel.grid(row=0, column=0, sticky="nsew", padx=28, pady=28)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            header,
+            text="Configurar dados de coleta",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w")
+
+        back_button = ctk.CTkButton(header, text="Voltar", width=110, command=self.on_back)
+        back_button.grid(row=0, column=1, sticky="e")
+
+        mode_text = "Modo local/offline" if is_offline else "Servidor online"
+        mode_color = "#d97706" if is_offline else "#16a34a"
+        mode_label = ctk.CTkLabel(
+            panel,
+            text=f"{mode_text}. Alteracoes salvas apenas no estado local.",
+            text_color=mode_color,
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        )
+        mode_label.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 14))
+
+        example_panel = ctk.CTkFrame(panel, corner_radius=8)
+        example_panel.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 14))
+        example_panel.grid_columnconfigure(0, weight=1)
+
+        example_label = ctk.CTkLabel(example_panel, text="Texto de exemplo para testar regex")
+        example_label.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 6))
+
+        self.example_textbox = ctk.CTkTextbox(example_panel, height=82, wrap="word")
+        self.example_textbox.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.example_textbox.insert(
+            "1.0",
+            "Notebook Vision Ryzen 7 com 16GB RAM, SSD 512GB, preco R$ 3.499,90 "
+            "e link https://loja.exemplo/notebook",
+        )
+
+        actions = ctk.CTkFrame(panel, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 10))
+        actions.grid_columnconfigure(0, weight=1)
+
+        fields_label = ctk.CTkLabel(
+            actions,
+            text="Campos de coleta",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        fields_label.grid(row=0, column=0, sticky="w")
+
+        restore_button = ctk.CTkButton(
+            actions,
+            text="Restaurar padr\u00f5es",
+            width=150,
+            command=self.restore_defaults,
+        )
+        restore_button.grid(row=0, column=1, sticky="e", padx=(0, 10))
+
+        save_button = ctk.CTkButton(
+            actions,
+            text="Salvar localmente",
+            width=150,
+            command=self.save_local,
+        )
+        save_button.grid(row=0, column=2, sticky="e")
+
+        self.fields_container = ctk.CTkScrollableFrame(panel, corner_radius=8)
+        self.fields_container.grid(row=4, column=0, sticky="nsew", padx=24, pady=(0, 16))
+        self.fields_container.grid_columnconfigure(0, weight=1)
+
+        self.status_label = ctk.CTkLabel(
+            panel,
+            text="Edite os patterns e teste contra o texto de exemplo antes de salvar.",
+            text_color=("gray35", "gray70"),
+            wraplength=700,
+            justify="left",
+            anchor="w",
+        )
+        self.status_label.grid(row=5, column=0, sticky="ew", padx=24, pady=(0, 24))
+
+        self.refresh_fields()
+
+    def _set_status(self, message: str, color: str | tuple[str, str] = ("gray35", "gray70")) -> None:
+        self.status_label.configure(text=message, text_color=color)
+
+    def _coerce_bool(self, value: Any, *, default: bool = True) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "sim", "yes", "on"}
+        return bool(value)
+
+    def _build_draft_collection(self) -> dict[str, dict[str, Any]]:
+        default_collection = get_default_collection_config()
+        raw_collection = self.current_config.get("COLETA")
+        if not isinstance(raw_collection, Mapping):
+            raw_collection = {}
+
+        draft: dict[str, dict[str, Any]] = {}
+
+        for field_name, default_field in default_collection.items():
+            raw_field = raw_collection.get(field_name)
+            draft[field_name] = self._normalize_field(raw_field, default_field)
+
+        for field_name, raw_field in raw_collection.items():
+            if field_name in draft:
+                continue
+            draft[str(field_name)] = self._normalize_field(
+                raw_field,
+                {"enabled": True, "pattern": ""},
+            )
+
+        return draft
+
+    def _normalize_field(self, raw_field: Any, default_field: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw_field, Mapping):
+            raw_field = {}
+
+        default_pattern = str(default_field.get("pattern") or "")
+        pattern = str(raw_field.get("pattern") or default_pattern)
+        enabled = self._coerce_bool(
+            raw_field.get("enabled"),
+            default=self._coerce_bool(default_field.get("enabled"), default=True),
+        )
+
+        return {"enabled": enabled, "pattern": pattern}
+
+    def _ordered_field_names(self) -> list[str]:
+        default_names = list(get_default_collection_config().keys())
+        extra_names = [name for name in self.draft_collection if name not in default_names]
+        return default_names + sorted(extra_names)
+
+    def refresh_fields(self) -> None:
+        for child in self.fields_container.winfo_children():
+            child.destroy()
+
+        self.pattern_entries.clear()
+        self.enabled_switches.clear()
+
+        for row_index, field_name in enumerate(self._ordered_field_names()):
+            field = self.draft_collection.setdefault(
+                field_name,
+                {"enabled": True, "pattern": ""},
+            )
+            self._create_field_row(row_index, field_name, field)
+
+    def _create_field_row(self, row_index: int, field_name: str, field: dict[str, Any]) -> None:
+        row = ctk.CTkFrame(self.fields_container, corner_radius=8)
+        row.grid(row=row_index, column=0, sticky="ew", padx=8, pady=6)
+        row.grid_columnconfigure(2, weight=1)
+
+        name_label = ctk.CTkLabel(
+            row,
+            text=field_name,
+            width=80,
+            font=ctk.CTkFont(weight="bold"),
+        )
+        name_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=10)
+
+        enabled_switch = ctk.CTkSwitch(row, text="", width=52, onvalue=True, offvalue=False)
+        enabled_switch.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=10)
+        if self._coerce_bool(field.get("enabled"), default=True):
+            enabled_switch.select()
+        else:
+            enabled_switch.deselect()
+        self.enabled_switches[field_name] = enabled_switch
+
+        pattern_entry = ctk.CTkEntry(row, height=38)
+        pattern_entry.grid(row=0, column=2, sticky="ew", padx=(0, 10), pady=10)
+        pattern_entry.insert(0, str(field.get("pattern") or ""))
+        self.pattern_entries[field_name] = pattern_entry
+
+        test_button = ctk.CTkButton(
+            row,
+            text="Testar",
+            width=82,
+            command=lambda selected_field=field_name: self.test_pattern(selected_field),
+        )
+        test_button.grid(row=0, column=3, sticky="e", padx=(0, 12), pady=10)
+
+    def _read_draft_from_ui(self) -> dict[str, dict[str, Any]]:
+        draft: dict[str, dict[str, Any]] = {}
+
+        for field_name in self._ordered_field_names():
+            switch = self.enabled_switches[field_name]
+            entry = self.pattern_entries[field_name]
+            draft[field_name] = {
+                "enabled": bool(switch.get()),
+                "pattern": entry.get().strip(),
+            }
+
+        return draft
+
+    def _validate_collection(self, collection: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        if not any(bool(field.get("enabled")) for field in collection.values()):
+            raise ValidationError("Ative pelo menos um campo de coleta.")
+
+        validated: dict[str, dict[str, Any]] = {}
+
+        for field_name, field in collection.items():
+            try:
+                pattern = validate_collection_regex(str(field.get("pattern") or ""))
+            except ValidationError as exc:
+                raise ValidationError(f"{field_name}: {exc}") from exc
+
+            validated[field_name] = {
+                "enabled": bool(field.get("enabled")),
+                "pattern": pattern,
+            }
+
+        return validated
+
+    def test_pattern(self, field_name: str) -> None:
+        pattern = self.pattern_entries[field_name].get().strip()
+
+        try:
+            validated_pattern = validate_collection_regex(pattern)
+        except ValidationError as exc:
+            self._set_status(f"{field_name}: {exc}", "#dc2626")
+            return
+
+        sample_text = self.example_textbox.get("1.0", "end").strip()
+        if not sample_text:
+            self._set_status("Informe um texto de exemplo para testar a regex.", "#dc2626")
+            return
+
+        compiled_pattern = re.compile(validated_pattern)
+        matches = list(compiled_pattern.finditer(sample_text))
+
+        if not matches:
+            self._set_status(f"{field_name}: regex valida, mas sem correspondencias.", "#d97706")
+            return
+
+        preview = ", ".join(match.group(0)[:80] for match in matches[:5])
+        extra_count = len(matches) - 5
+        suffix = f" (+{extra_count})" if extra_count > 0 else ""
+        self._set_status(
+            f"{field_name}: {len(matches)} correspondencia(s){suffix}: {preview}",
+            "#16a34a",
+        )
+
+    def restore_defaults(self) -> None:
+        self.draft_collection = get_default_collection_config()
+        self.refresh_fields()
+        self._set_status("Patterns padrao restaurados no rascunho. Clique em Salvar localmente para aplicar.", "#16a34a")
+
+    def save_local(self) -> None:
+        try:
+            validated_collection = self._validate_collection(self._read_draft_from_ui())
+        except ValidationError as exc:
+            self._set_status(str(exc), "#dc2626")
+            return
+
+        self.draft_collection = deepcopy(validated_collection)
+        self.current_config["COLETA"] = deepcopy(validated_collection)
+        message = "Dados de coleta salvos no estado local."
+        self.mode_message = message
+        self.on_current_config_changed(self.current_config, self.is_offline, message)
+        self.refresh_fields()
+        self._set_status(message, "#16a34a")
+
+
 class MainMenuFrame(ctk.CTkFrame):
     def __init__(
         self,
@@ -647,6 +948,7 @@ class MainMenuFrame(ctk.CTkFrame):
         mode_message: str,
         on_edit_connection: Callable[[], None],
         on_configure_messages: Callable[[], None],
+        on_configure_collection: Callable[[], None],
         on_current_config_changed: Callable[[dict[str, Any], bool, str], None],
         on_exit: Callable[[], None],
     ) -> None:
@@ -656,6 +958,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.is_offline = is_offline
         self.on_edit_connection = on_edit_connection
         self.on_configure_messages = on_configure_messages
+        self.on_configure_collection = on_configure_collection
         self.on_current_config_changed = on_current_config_changed
         self.on_exit = on_exit
 
@@ -772,7 +1075,7 @@ class MainMenuFrame(ctk.CTkFrame):
         self.on_configure_messages()
 
     def configure_collection(self) -> None:
-        self._not_ready("Configurar dados de coleta")
+        self.on_configure_collection()
 
     def validate_local_config(self) -> None:
         try:
@@ -970,6 +1273,7 @@ class App(ctk.CTk):
                 mode_message=self.mode_message,
                 on_edit_connection=self.show_connection,
                 on_configure_messages=self.show_messages_screen,
+                on_configure_collection=self.show_collection_screen,
                 on_current_config_changed=self._update_current_config,
                 on_exit=self.destroy,
             )
@@ -978,6 +1282,23 @@ class App(ctk.CTk):
     def show_messages_screen(self) -> None:
         self._replace_frame(
             MessageConfigFrame(
+                self,
+                current_config=self.current_config,
+                is_offline=self.is_offline,
+                mode_message=self.mode_message,
+                on_back=lambda: self.show_main_menu(
+                    self.connection_config,
+                    self.current_config,
+                    self.is_offline,
+                    self.mode_message,
+                ),
+                on_current_config_changed=self._update_current_config,
+            )
+        )
+
+    def show_collection_screen(self) -> None:
+        self._replace_frame(
+            CollectionConfigFrame(
                 self,
                 current_config=self.current_config,
                 is_offline=self.is_offline,

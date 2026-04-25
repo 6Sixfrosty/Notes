@@ -19,16 +19,23 @@ class ConfigError(Exception):
 class AppConfig:
     api_base_url: str = ""
     auth_token: str = ""
+    last_history_run_id: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
         return cls(
             api_base_url=str(data.get("api_base_url") or "").strip(),
             auth_token=str(data.get("auth_token") or ""),
+            last_history_run_id=str(data.get("last_history_run_id") or ""),
         )
 
 
-def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
+def _resolve_config_path(config_path: Path | None) -> Path:
+    return config_path or DEFAULT_CONFIG_PATH
+
+
+def load_config(config_path: Path | None = None) -> AppConfig:
+    config_path = _resolve_config_path(config_path)
     if not config_path.exists():
         return AppConfig()
 
@@ -46,7 +53,8 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     return AppConfig.from_dict(data)
 
 
-def save_config(config: AppConfig, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+def save_config(config: AppConfig, config_path: Path | None = None) -> None:
+    config_path = _resolve_config_path(config_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:

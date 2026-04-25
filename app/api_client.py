@@ -8,12 +8,21 @@ import httpx
 
 EXPECTED_SERVICE_NAME = "alerta-dos-notebooks-api"
 DEFAULT_SEARCH_CONFIG_PATH = "/api/v1/search-configs/default"
+HISTORY_RUNS_PATH = "/api/v1/history-runs"
 SYNC_STATUS_MESSAGES = {
     400: "JSON inv\u00e1lido.",
     401: "Token ausente ou expirado.",
     403: "Token inv\u00e1lido.",
     409: "Conflito de vers\u00e3o. Recarregue a configura\u00e7\u00e3o do servidor.",
     422: "Configura\u00e7\u00e3o inv\u00e1lida no servidor.",
+    429: "Muitas requisi\u00e7\u00f5es. Tente novamente depois.",
+    500: "Erro interno do servidor.",
+}
+HISTORY_RUN_STATUS_MESSAGES = {
+    400: "Data inv\u00e1lida.",
+    401: "Token inv\u00e1lido.",
+    403: "Token inv\u00e1lido.",
+    422: "Data inv\u00e1lida.",
     429: "Muitas requisi\u00e7\u00f5es. Tente novamente depois.",
     500: "Erro interno do servidor.",
 }
@@ -73,7 +82,7 @@ def _request_json(
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         message = (
-            status_messages.get(status_code)
+            status_messages.get(status_code, f"Servidor respondeu com status HTTP {status_code}.")
             if status_messages is not None
             else f"Servidor respondeu com status HTTP {status_code}."
         )
@@ -131,4 +140,23 @@ def sync_default_search_config(
         status_messages=SYNC_STATUS_MESSAGES,
         timeout_message="Tempo de conex\u00e3o excedido.",
         request_error_message="Servidor indispon\u00edvel. Configura\u00e7\u00e3o mantida localmente.",
+    )
+
+
+def start_history_run(
+    api_base_url: str,
+    auth_token: str,
+    date_limit: str,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    return _request_json(
+        "POST",
+        api_base_url,
+        HISTORY_RUNS_PATH,
+        auth_token,
+        timeout,
+        json_body={"date_limit": date_limit},
+        status_messages=HISTORY_RUN_STATUS_MESSAGES,
+        timeout_message="Tempo de conex\u00e3o excedido.",
+        request_error_message="Servidor offline.",
     )

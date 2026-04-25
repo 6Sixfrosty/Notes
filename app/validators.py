@@ -10,6 +10,11 @@ from urllib.parse import urlparse
 class ValidationError(ValueError):
     """Raised with a user-safe validation message."""
 
+    def __init__(self, message: str, *, field: str | None = None, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.field = field
+        self.reason = reason or message
+
 
 MESSAGE_QUERY_KEYS = (
     "query",
@@ -203,28 +208,62 @@ def _has_enabled_collection_field(fields: Sequence[Any]) -> bool:
     return False
 
 
-def _validate_collection_patterns(fields: Sequence[Any]) -> None:
-    for field in fields:
-        if not isinstance(field, Mapping) or not _is_enabled(field.get("enabled"), default=False):
-            continue
+def _validate_collection_patterns_with_fields(collection_fields: Any) -> None:
+    if isinstance(collection_fields, Mapping):
+        iterable = collection_fields.items()
+    else:
+        iterable = enumerate(_iter_collection_fields(collection_fields), start=1)
+
+    for field_name, field in iterable:
+        if not isinstance(field, Mapping):
+            raise ValidationError(
+                "Campo de coleta invalido.",
+                field=f"COLETA.{field_name}",
+                reason="deve ter enabled e pattern",
+            )
 
         pattern = field.get("pattern")
-        if pattern is not None:
-            validate_collection_regex(pattern)
+        try:
+            validate_collection_regex(str(pattern or ""))
+        except ValidationError as exc:
+            raise ValidationError(
+                str(exc),
+                field=f"COLETA.{field_name}.pattern",
+                reason=str(exc),
+            ) from exc
 
 
 def validate_complete_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(config, Mapping):
-        raise ValidationError("A configuracao deve estar em um formato valido.")
+        raise ValidationError(
+            "A configuracao deve estar em um formato valido.",
+            field="configuracao",
+            reason="formato invalido",
+        )
 
     messages_key, messages = _read_first_value(config, MESSAGE_LIST_KEYS)
     if messages_key is None:
-        raise ValidationError("Informe a lista de mensagens.")
+        raise ValidationError(
+            "Informe a lista de mensagens.",
+            field="MENSAGENS",
+            reason="campo ausente",
+        )
 
-    normalized_messages = validate_message_list(messages)
+    try:
+        normalized_messages = validate_message_list(messages)
+    except ValidationError as exc:
+        raise ValidationError(
+            str(exc),
+            field=exc.field or "MENSAGENS",
+            reason=exc.reason,
+        ) from exc
 
     if not any(_message_enabled(message) for message in normalized_messages):
-        raise ValidationError("A configuracao deve ter pelo menos uma mensagem ativa.")
+        raise ValidationError(
+            "A configuracao deve ter pelo menos uma mensagem ativa.",
+            field="MENSAGENS",
+            reason="pelo menos uma mensagem deve estar ativa",
+        )
 
     seen_ids: set[str] = set()
     seen_queries: set[str] = set()
@@ -234,27 +273,47 @@ def validate_complete_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if message_id not in (None, ""):
             normalized_id = str(message_id)
             if normalized_id in seen_ids:
-                raise ValidationError(f"O id de mensagem '{normalized_id}' esta repetido.")
+                raise ValidationError(
+                    f"O id de mensagem '{normalized_id}' esta repetido.",
+                    field="MENSAGENS.id",
+                    reason=f"id '{normalized_id}' repetido",
+                )
             seen_ids.add(normalized_id)
 
         normalized_query = _message_query(message).casefold()
         if normalized_query in seen_queries:
-            raise ValidationError(f"A query '{_message_query(message)}' esta repetida.")
+            raise ValidationError(
+                f"A query '{_message_query(message)}' esta repetida.",
+                field="MENSAGENS.query",
+                reason=f"query '{_message_query(message)}' repetida",
+            )
         seen_queries.add(normalized_query)
 
     collection_key, collection_fields = _read_first_value(config, COLLECTION_FIELD_KEYS)
     if collection_key is None:
-        raise ValidationError("Informe os campos de coleta.")
+        raise ValidationError(
+            "Informe os campos de coleta.",
+            field="COLETA",
+            reason="campo ausente",
+        )
 
     fields = _iter_collection_fields(collection_fields)
     if not _has_enabled_collection_field(fields):
-        raise ValidationError("A configuracao deve ter pelo menos um campo de coleta ativo.")
-    _validate_collection_patterns(fields)
+        raise ValidationError(
+            "A configuracao deve ter pelo menos um campo de coleta ativo.",
+            field="COLETA",
+            reason="pelo menos um campo deve estar enabled=true",
+        )
+    _validate_collection_patterns_with_fields(collection_fields)
 
     normalized_config = dict(config)
     normalized_config[messages_key] = normalized_messages
     normalized_config[collection_key] = collection_fields
     return normalized_config
+
+
+def validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    return validate_complete_config(config)
 
 
 def validate_limit_date(value: str) -> str:

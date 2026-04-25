@@ -5,8 +5,9 @@ import re
 import threading
 from collections.abc import Mapping
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 from typing import Any, Callable
 
 import customtkinter as ctk
@@ -17,13 +18,26 @@ from .validators import (
     ValidationError,
     validate_api_url,
     validate_collection_regex,
-    validate_complete_config,
+    validate_config,
     validate_message_key,
     validate_token,
 )
 
 
 APP_TITLE = "Alerta dos Notebooks"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+EXPORTS_DIR = PROJECT_ROOT / "exports"
+SENSITIVE_BACKUP_KEY_PARTS = (
+    "api_base_url",
+    "api_url",
+    "apibaseurl",
+    "token",
+    "secret",
+    "password",
+    "senha",
+    "api_key",
+    "authorization",
+)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "config_id": "default",
@@ -50,6 +64,30 @@ def get_default_config() -> dict[str, Any]:
 
 def get_default_collection_config() -> dict[str, dict[str, Any]]:
     return deepcopy(DEFAULT_CONFIG["COLETA"])
+
+
+def get_backup_path(today: date | None = None) -> Path:
+    export_date = today or date.today()
+    return EXPORTS_DIR / f"search_backup_{export_date:%Y_%m_%d}.json"
+
+
+def _is_sensitive_backup_key(key: Any) -> bool:
+    normalized_key = str(key).casefold().replace("-", "_").replace(" ", "_")
+    return any(key_part in normalized_key for key_part in SENSITIVE_BACKUP_KEY_PARTS)
+
+
+def sanitize_config_for_backup(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: sanitize_config_for_backup(item)
+            for key, item in value.items()
+            if not _is_sensitive_backup_key(key)
+        }
+
+    if isinstance(value, list):
+        return [sanitize_config_for_backup(item) for item in value]
+
+    return value
 
 
 class ConnectionFrame(ctk.CTkFrame):
@@ -1079,9 +1117,14 @@ class MainMenuFrame(ctk.CTkFrame):
 
     def validate_local_config(self) -> None:
         try:
-            validated_config = validate_complete_config(self.current_config)
+            validated_config = validate_config(self.current_config)
         except ValidationError as exc:
-            self._set_status(f"Configura\u00e7\u00e3o local invalida: {exc}", "#dc2626")
+            field = exc.field or "configuracao"
+            reason = exc.reason or str(exc)
+            self._set_status(
+                f"Configura\u00e7\u00e3o local inv\u00e1lida. Campo: {field}. Motivo: {reason}.",
+                "#dc2626",
+            )
             return
 
         self._replace_current_config(
@@ -1089,7 +1132,7 @@ class MainMenuFrame(ctk.CTkFrame):
             self.is_offline,
             "Configura\u00e7\u00e3o local validada em memoria.",
         )
-        self._set_status("Configura\u00e7\u00e3o local valida.", "#16a34a")
+        self._set_status("Configura\u00e7\u00e3o local v\u00e1lida.", "#16a34a")
 
     def sync_with_server(self) -> None:
         self._set_status("Sincronizacao com servidor ainda nao tem endpoint definido.", "#d97706")
@@ -1127,26 +1170,37 @@ class MainMenuFrame(ctk.CTkFrame):
         self._show_json_window("Configura\u00e7\u00e3o do servidor", server_config)
 
     def export_backup(self) -> None:
-        file_path = filedialog.asksaveasfilename(
-            title="Exportar backup",
-            initialfile="search.json",
-            defaultextension=".json",
-            filetypes=[("Arquivos JSON", "*.json"), ("Todos os arquivos", "*.*")],
-        )
-
-        if not file_path:
-            self._set_status("Exportacao cancelada.", ("gray35", "gray70"))
-            return
+        backup_path = get_backup_path()
 
         try:
-            with Path(file_path).open("w", encoding="utf-8") as backup_file:
-                json.dump(self.current_config, backup_file, ensure_ascii=False, indent=2)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Nao foi possivel criar a pasta exports: {exc}", "#dc2626")
+            return
+
+        if backup_path.exists():
+            relative_path = backup_path.relative_to(PROJECT_ROOT)
+            confirmed = messagebox.askyesno(
+                "Confirmar exportacao",
+                f"O arquivo {relative_path} ja existe.\n\nDeseja substituir?",
+                parent=self,
+            )
+            if not confirmed:
+                self._set_status("Exportacao cancelada.", ("gray35", "gray70"))
+                return
+
+        backup_config = sanitize_config_for_backup(self.current_config)
+
+        try:
+            with backup_path.open("w", encoding="utf-8") as backup_file:
+                json.dump(backup_config, backup_file, ensure_ascii=False, indent=2)
                 backup_file.write("\n")
         except OSError as exc:
             self._set_status(f"Nao foi possivel exportar o backup: {exc}", "#dc2626")
             return
 
-        self._set_status(f"Backup exportado para {file_path}.", "#16a34a")
+        relative_path = backup_path.relative_to(PROJECT_ROOT)
+        self._set_status(f"Backup exportado para {relative_path}.", "#16a34a")
 
     def run_historical_search(self) -> None:
         self._not_ready("Executar pesquisa hist\u00f3rica")
